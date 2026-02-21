@@ -1,0 +1,302 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AI Career Coach - Simplified Stack (Knowledge Base created via Console)'
+
+Parameters:
+  FoundationModelId:
+    Type: String
+    Default: 'anthropic.claude-3-sonnet-20240229-v1:0'
+    Description: Foundation model for Knowledge Base
+    AllowedValues:
+      - 'anthropic.claude-3-sonnet-20240229-v1:0'
+      - 'anthropic.claude-3-haiku-20240307-v1:0'
+
+Resources:
+  # S3 Bucket for Knowledge Base Documents
+  KnowledgeBaseDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-kb-data-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      Tags:
+        - Key: Application
+          Value: AI-Career-Coach
+
+  # DynamoDB Table for Career Plans
+  CareerPlansTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${AWS::StackName}-career-plans'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: user_id
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: user_id
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      Tags:
+        - Key: Application
+          Value: AI-Career-Coach
+
+  # Lambda Execution Role
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: BedrockAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:Retrieve
+                  - bedrock:RetrieveAndGenerate
+                Resource: '*'
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource: !GetAtt CareerPlansTable.Arn
+
+  # Lambda Function (KB ID will be added manually after KB creation)
+  CareerCoachFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-handler'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      MemorySize: 512
+      Environment:
+        Variables:
+          KNOWLEDGE_BASE_ID: 'UPDATE_AFTER_KB_CREATION'
+          DYNAMODB_TABLE: !Ref CareerPlansTable
+          MODEL_ARN: !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/${FoundationModelId}'
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime
+          import uuid
+
+          bedrock_agent = boto3.client('bedrock-agent-runtime')
+          dynamodb = boto3.resource('dynamodb')
+          table = dynamodb.Table(os.environ['DYNAMODB_TABLE'])
+
+          def lambda_handler(event, context):
+              try:
+                  # Parse input
+                  body = json.loads(event.get('body', '{}'))
+                  current_role = body.get('current_role', '')
+                  goal = body.get('goal', '')
+                  user_id = body.get('user_id', str(uuid.uuid4()))
+                  
+                  if not current_role or not goal:
+                      return {
+                          'statusCode': 400,
+                          'headers': {'Content-Type': 'application/json'},
+                          'body': json.dumps({'error': 'current_role and goal are required'})
+                      }
+                  
+                  # Create prompt
+                  prompt = f"""You are an expert career coach. Create a personalized career development plan.
+
+          Current Role: {current_role}
+          Career Goal: {goal}
+
+          Provide a comprehensive career development plan that includes:
+          1. Recommended internal training courses (from the knowledge base)
+          2. Key skills to develop
+          3. Suggested timeline (3-6 months)
+          4. Additional certifications or learning resources
+
+          Be specific and actionable."""
+
+                  # Call Bedrock Knowledge Base
+                  kb_id = os.environ.get('KNOWLEDGE_BASE_ID')
+                  
+                  if not kb_id or kb_id == 'UPDATE_AFTER_KB_CREATION':
+                      return {
+                          'statusCode': 500,
+                          'headers': {'Content-Type': 'application/json'},
+                          'body': json.dumps({
+                              'error': 'Knowledge Base ID not configured. Please update Lambda environment variable.'
+                          })
+                      }
+                  
+                  # Try with retrieval configuration
+                  response = bedrock_agent.retrieve_and_generate(
+                      input={'text': prompt},
+                      retrieveAndGenerateConfiguration={
+                          'type': 'KNOWLEDGE_BASE',
+                          'knowledgeBaseConfiguration': {
+                              'knowledgeBaseId': kb_id,
+                              'modelArn': os.environ['MODEL_ARN'],
+                              'retrievalConfiguration': {
+                                  'vectorSearchConfiguration': {
+                                      'numberOfResults': 5
+                                  }
+                              }
+                          }
+                      }
+                  )
+                  
+                  # Extract response
+                  generated_text = response['output']['text']
+                  citations = response.get('citations', [])
+                  
+                  # Save to DynamoDB
+                  timestamp = datetime.utcnow().isoformat()
+                  table.put_item(Item={
+                      'user_id': user_id,
+                      'timestamp': timestamp,
+                      'current_role': current_role,
+                      'goal': goal,
+                      'career_plan': generated_text,
+                      'citations': citations
+                  })
+                  
+                  return {
+                      'statusCode': 200,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*'
+                      },
+                      'body': json.dumps({
+                          'user_id': user_id,
+                          'current_role': current_role,
+                          'goal': goal,
+                          'career_plan': generated_text,
+                          'citations': citations,
+                          'timestamp': timestamp
+                      }, indent=2)
+                  }
+                  
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  import traceback
+                  print(traceback.format_exc())
+                  return {
+                      'statusCode': 500,
+                      'headers': {'Content-Type': 'application/json'},
+                      'body': json.dumps({'error': str(e)})
+                  }
+
+  # API Gateway
+  CareerCoachAPI:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub '${AWS::StackName}-api'
+      ProtocolType: HTTP
+      Description: API for AI Career Coach
+      CorsConfiguration:
+        AllowOrigins:
+          - '*'
+        AllowMethods:
+          - POST
+          - GET
+          - OPTIONS
+        AllowHeaders:
+          - '*'
+
+  ApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref CareerCoachAPI
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt CareerCoachFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  ApiRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref CareerCoachAPI
+      RouteKey: 'POST /generate-plan'
+      Target: !Sub 'integrations/${ApiIntegration}'
+
+  ApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref CareerCoachAPI
+      StageName: prod
+      AutoDeploy: true
+
+  # Lambda Permission for API Gateway
+  LambdaApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CareerCoachFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${CareerCoachAPI}/*'
+
+Outputs:
+  S3BucketName:
+    Description: S3 bucket for knowledge base documents (use this when creating KB)
+    Value: !Ref KnowledgeBaseDataBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-S3Bucket'
+
+  S3BucketArn:
+    Description: S3 bucket ARN (use this when creating KB data source)
+    Value: !GetAtt KnowledgeBaseDataBucket.Arn
+
+  LambdaFunctionName:
+    Description: Lambda function name (update this after creating KB)
+    Value: !Ref CareerCoachFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunction'
+
+  ApiEndpoint:
+    Description: API Gateway endpoint URL (test this after updating Lambda)
+    Value: !Sub 'https://${CareerCoachAPI}.execute-api.${AWS::Region}.amazonaws.com/prod/generate-plan'
+    Export:
+      Name: !Sub '${AWS::StackName}-ApiEndpoint'
+
+  DynamoDBTable:
+    Description: DynamoDB table for career plans
+    Value: !Ref CareerPlansTable
+    Export:
+      Name: !Sub '${AWS::StackName}-DynamoDBTable'
+
+  NextSteps:
+    Description: What to do next
+    Value: |
+      1. Upload internal_courses.md to S3 bucket
+      2. Create Bedrock Knowledge Base via Console (see deployment guide)
+      3. Update Lambda environment variable with KB ID
+      4. Test the API endpoint
